@@ -69,8 +69,8 @@ Version 1.0 | Language & Platform Agnostic
 │  TaroDomain.builder(): wires the layers and routes        │ │      UUIDv7     │
 │  each command to the strong or eventual pipeline          │ │   Backoff and   │
 ├──────────────────────┬────────────────────────────────────┤ │      jitter     │
-│  Command Pipeline    │      Event Bus                     │ │                 │
-│  (strong / eventual) │  (InMemory / Queue / Cron)         │ │                 │
+│  Command Pipeline    │      Event Bus                     │ │     Context     │
+│  (strong / eventual) │  (InMemory / Queue / Cron)         │ │     storage     │
 │                      │  Contracts: EventBus, EventHandler │ │                 │
 ├──────────────────────┼──────────────────────┬─────────────┤ │                 │
 │  Command Handler     │  Projection Handler  │ Saga Handler│ │                 │
@@ -133,7 +133,7 @@ An arrow `A ──▶ B` means A depends on B. A layer may depend on any layer b
 ```
 
 - **Domain** depends only on the Kernel. It never references persistence, buses or platforms.
-- **Kernel** holds cross-cutting building blocks: the error hierarchy (§22), UUIDv7 generation (§2.1), and backoff with jitter (§16.2, §21.3). It depends on nothing, and every layer may use it.
+- **Kernel** holds cross-cutting building blocks: the error hierarchy (§22), UUIDv7 generation (§2.1), backoff with jitter (§16.2, §21.3), and request-scoped context storage (§5.5). It depends on nothing, and every layer may use it.
 - **Platform** is at the bottom of the call order but near the top of the dependency order. It implements the Persistence contracts, including `UnitOfWork` (§11.4), and `EventBus` (§10). Only the Framework chooses a platform (§24).
 - **Event Bus contracts** (`EventBus`, `EventHandler`) belong to the Event Bus layer but depend only on the Domain. Handlers and Persistence may use these contracts, never the bus implementations: the Repository publishes through `EventBus` (§6.2), and projection and saga handlers implement `EventHandler` (§12.1, §13.3).
 
@@ -168,8 +168,8 @@ HTTP POST → Command → Pipeline → Handler → Aggregate.raise() → Event
 | Property | Type | Description |
 |---|---|---|
 | `id` | UUIDv7 (string) | Globally unique, time-ordered (sortable) |
-| `eventName` | string | Event type name (default: class name; overridable for minification) |
-| `eventVersion` | string | Schema version (semver: "1.0.0"). Used by upcasters. |
+| `eventName` | string | Event type name. Default: the class name. A class may declare its own (for minified builds); subclasses don't inherit it. |
+| `eventVersion` | string | Schema version (semver). Default: `"1.0.0"`. Declared per class, like `eventName`. Used by upcasters. |
 | `correlationId` | UUIDv7 | End-to-end trace ID. Inherited from command. |
 | `causationId` | UUIDv7 \| null | ID of the command/event that caused this event. null = root. |
 | `metadata` | Map<string, primitive> | Free-form metadata (userId, tenantId, IP, etc.). Frozen. |
@@ -178,10 +178,11 @@ HTTP POST → Command → Pipeline → Handler → Aggregate.raise() → Event
 
 **Rules:**
 
-- Immutable (frozen after construction).
+- Immutable. Frozen, with everything it holds, when it is raised (§5.2), rehydrated or published (§10). The base constructor can't freeze it, because subclass fields are assigned after it runs.
 - `id` auto-generated as UUIDv7 if not provided.
 - `correlationId` auto-generated if not provided (new trace root).
 - `causationId` defaults to `null` (root command).
+- A provided `id`, `correlationId` or non-null `causationId` must be a UUID (any version). Otherwise: `INVALID_EVENT_ID`, `INVALID_CORRELATION_ID` or `INVALID_CAUSATION_ID`.
 
 **Serialization (`SerializedEvent`):**
 
@@ -196,7 +197,9 @@ HTTP POST → Command → Pipeline → Handler → Aggregate.raise() → Event
 | `metadata` | JSON of metadata |
 | `occurred_at` | ISO 8601 timestamp |
 
-**Rehydration (`rehydrate(data, init)`):** Static method that constructs an event from stored data WITHOUT calling the constructor. Uses `Object.create(prototype)` + `Object.defineProperty` for each field. Preserves all validations.
+`data` and `metadata` are JSON values. Business fields go through JSON on serialization: dates become ISO strings, value objects become their `value`.
+
+**Rehydration (`rehydrate(data, init)`):** Static method that constructs an event from stored data WITHOUT calling the constructor. Uses `Object.create(prototype)` + `Object.defineProperty` for each field. Preserves all validations. The result is frozen.
 
 ### 2.2 Command
 
@@ -206,18 +209,24 @@ HTTP POST → Command → Pipeline → Handler → Aggregate.raise() → Event
 
 **Difference from event:** Commands represent intent (future), events represent facts (past). Commands can be rejected; events cannot.
 
+**Name:** `commandName`. Default: the class name, overridable per class like `eventName`. Used to find the class again when deserializing (§4.3).
+
+**Validation:** As for events, with `INVALID_COMMAND_ID`, `INVALID_COMMAND_CORRELATION_ID` and `INVALID_COMMAND_CAUSATION_ID`.
+
+**Serialization (`SerializedCommand`):** `command_id`, `command_type`, `causation_id`, `correlation_id`, `data`, `metadata`, `timestamp` (ISO 8601). `rehydrate(data, init)` works as for events.
+
 ### 2.3 ValueObject\<T>
 
 **Purpose:** Object defined by its value, not identity. Immutable.
 
 **Properties:**
 
-- `value: T` — the inner value.
-- Structural equality (`equals(other)`).
+- `value: T` — the inner value. Deeply frozen.
+- Structural equality (`equals(other)`): the same class, and deeply equal values.
 - `hashCode()` — consistent with `equals()`.
-- Optional `compareTo(other)` for ordered VOs.
-- `validate(value)` hook — invariants checked at construction.
-- `with(mutator)` — functional update (returns new instance).
+- Optional `compareTo(other)` for ordered VOs. Unordered VOs throw `INCOMPARABLE_VALUE`.
+- `validate(value)` hook — invariants checked at construction. Return `false` or throw a framework error to reject the value; `false` becomes `VALUE_OBJECT_INVALID`. Any other error becomes `VALUE_OBJECT_CONSTRUCTION_FAILED`.
+- `with(mutator)` — functional update (returns new instance, validated).
 
 ### 2.4 AggregateId
 
@@ -230,6 +239,8 @@ HTTP POST → Command → Pipeline → Handler → Aggregate.raise() → Event
 - `generate()` — fresh UUIDv7.
 - `fromExisting(uuid)` — parse any valid UUID (any version).
 - `fromUuidv7(uuid)` — parse, enforce v7 only.
+
+Values are stored in lower case, so equality ignores case. An invalid UUID throws `VALUE_OBJECT_INVALID`.
 
 **Subclassing:** Users create type-safe subclasses (`class AccountId extends AggregateId`) to prevent mixing IDs at compile time.
 
@@ -371,15 +382,18 @@ Maps command classes to handlers. Also maps command type names to classes (for d
 
 **`raise(event)` flow:**
 
-1. If execution context is set → enrich event with `correlationId` + `causationId`.
+1. If execution context is set → enrich event with `correlationId` + `causationId`. The aggregate's own context (set by the repository on load) comes first; an aggregate without one, such as a new aggregate from a static factory, uses the ambient `ExecutionContext` (§5.5).
 2. Call `applyEvent(enrichedEvent)` → find `on[EventName]` method → call it → increment version.
 3. Push enriched event to uncommitted buffer.
+
+If the handler throws, nothing changes: the version stays, and the event is not queued.
 
 **`applyEvent(event)` flow:**
 
 1. Find method: `this["on" + event.eventName]`.
 2. If not found → call `onUnknownEvent(event)` (default: throw `MissingEventHandlerError`).
-3. If found → call handler → increment `#version`.
+3. If found → call handler.
+4. Increment `#version`. An event that an overridden `onUnknownEvent()` accepts still counts, so the version keeps matching the stream.
 
 ### 5.3 Constructor Rules
 
@@ -394,12 +408,13 @@ Maps command classes to handlers. Also maps command type names to classes (for d
 
 - Extract all own enumerable properties except `id`.
 - `#version` and `#uncommitted` are private (excluded automatically).
-- Override `toSnapshotState()` for `#private` fields.
+- Override `toSnapshotState()` for `#private` fields. Its result is stored under the reserved key `"#private"`.
+- Returns `{ data, version }`. `data` goes through JSON, so it matches what any store returns: dates become strings and value objects their `value`. Restore such fields in `restoreSnapshotState()`.
 
 **`restoreSnapshot(data, version)`:**
 
-- `Object.assign(this, data)` for public fields.
-- Override `restoreSnapshotState(data)` for `#private` fields.
+- `Object.assign(this, data)` for public fields (never `id` or `"#private"`).
+- Override `restoreSnapshotState(data)` for `#private` fields. It receives what `toSnapshotState()` returned.
 - Set `#version = version`, clear `#uncommitted`.
 
 ### 5.5 Execution Context
@@ -412,9 +427,19 @@ ExecutionContext.set({ correlationId: command.correlationId, causationId: comman
 // → aggregate.raise() enriches events with context
 // → repo.save() appends enriched events
 ExecutionContext.clear()
+
+ExecutionContext.run(context, work)  // scoped: set → work → the enclosing context is back
 ```
 
-> **Caveat:** Module-level variable — shared between concurrent requests in same process. For Cloudflare Workers, safe for sequential command processing. For high-concurrency, use eventual consistency or per-request context injection.
+Both IDs must be UUIDs (`INVALID_CORRELATION_ID`, `INVALID_CAUSATION_ID`).
+
+**Storage:** The context lives in the Kernel's request-scoped context storage, never in a plain module-level variable. The storage is pluggable:
+
+- `run(work)` opens a scope that starts as a copy of the enclosing one. Values set inside it are visible to `work` and everything it awaits, and are gone when it ends. A nested dispatch, such as a command a saga dispatches, therefore leaves the outer context intact.
+- The default is one process-wide stack of scopes. It is correct for sequential processing, as on a Cloudflare Worker. Concurrent requests in one process see each other's values while they overlap.
+- Runtimes with async-local storage (Node's `AsyncLocalStorage`, Workers with `nodejs_compat`) should install it, so concurrent requests never share a context.
+
+Providers whose `UnitOfWork` defers writes keep the active unit of work in the same storage (§11.4), so two concurrent requests never share a transaction.
 
 ---
 
@@ -1132,6 +1157,8 @@ Default: 3 retries, 100ms → 200ms → 400ms, ±10% jitter.
 | `infrastructure` | Yes | 500 | Transient failure — retry might succeed |
 | `configuration` | No | 500 | Framework misconfiguration — retrying won't help |
 
+`shouldRetry(error)` returns `error.retryable` for a `FrameworkError`. Any other error, such as a network or driver failure, counts as `infrastructure` and is retried, rather than dead-lettered or skipped.
+
 ### 22.2 Error Codes
 
 **Domain (19 codes):**
@@ -1160,6 +1187,10 @@ abstract class FrameworkError extends Error:
   toHttpResponse() → { status, body }
   toLogEntry() → object
 ```
+
+- `toHttpResponse()`: `body.error` holds `code`, `category`, `message` and `retryable`. It adds `context` for client errors (4xx) only, so server-side details never reach the caller. The `cause` is never included.
+- `toLogEntry()`: logs domain errors as warnings (they are rejections, not faults), everything else as errors.
+- User code may extend the category bases with its own codes, for example `class InsufficientFundsError extends DomainError`.
 
 ---
 
