@@ -1188,10 +1188,10 @@ interface Provider:
 
 ## 25. Builder DSL
 
-### 25.1 DddFramework.builder()
+### 25.1 TaroDomain.builder()
 
 ```ts
-DddFramework.builder()
+TaroDomain.builder()
   .useCloudflare({ env, ctx, provider? })        // or .useAws() / .useLocal() / .useProvider()
   .consistency('eventual', { transport: 'cloudflare_queue' })  // default for all commands
   .snapshotEvery(100)                              // global default
