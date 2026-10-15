@@ -61,33 +61,83 @@ Version 1.0 | Language & Platform Agnostic
 ### 1.2 Layered Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                    Worker Entry Point                     │
-│  (HTTP fetch / Queue consumer / Cron scheduled)           │
-├───────────────────────────────────────────────────────────┤
-│                    Framework (builder)                    │
-│  Routes commands to strong/eventual pipeline              │
-├──────────────────────┬────────────────────────────────────┤
-│  Command Pipeline    │      Event Bus                     │
-│  (strong / eventual) │  (InMemory / Queue / Cron)         │
-├──────────────────────┼──────────────────────┬─────────────┤
-│  Command Handler     │  Projection Handler  │ Saga Handler│
-│  (loads aggregate,   │  (updates read       │ (coordinates│
-│   executes, saves)   │   models)            │  multi-agg  │
-│                      │                      │  processes) │
-├──────────────────────┴──────────────────────┴─────────────┤
-│                  Domain Layer (pure)                      │
-│  AggregateRoot, DomainEvent, Command, ValueObject         │
-├───────────────────────────────────────────────────────────┤
-│              Persistence Layer (adapters)                 │
-│  EventStore, SnapshotStore, SagaStore, Repository         │
-├───────────────────────────────────────────────────────────┤
-│              Platform Layer (provider)                    │
-│  Cloudflare (D1/Queue/Cron) / AWS (DynamoDB/SQS) / Local  │
-└───────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐ ┌─────────────────┐
+│                     Worker Entry Point                    │ │      Kernel     │
+│  (HTTP fetch / Queue consumer / Cron scheduled)           │ │ (cross-cutting) │
+├───────────────────────────────────────────────────────────┤ │                 │
+│                    Framework (builder)                    │ │ Error hierarchy │
+│  TaroDomain.builder(): wires the layers and routes        │ │      UUIDv7     │
+│  each command to the strong or eventual pipeline          │ │   Backoff and   │
+├──────────────────────┬────────────────────────────────────┤ │      jitter     │
+│  Command Pipeline    │      Event Bus                     │ │                 │
+│  (strong / eventual) │  (InMemory / Queue / Cron)         │ │                 │
+│                      │  Contracts: EventBus, EventHandler │ │                 │
+├──────────────────────┼──────────────────────┬─────────────┤ │                 │
+│  Command Handler     │  Projection Handler  │ Saga Handler│ │                 │
+│  (loads aggregate,   │  (updates read       │ (coordinates│ │                 │
+│   executes, saves)   │   models)            │  multi-agg  │ │                 │
+│                      │                      │  processes) │ │                 │
+├──────────────────────┴──────────────────────┴─────────────┤ │                 │
+│                    Domain Layer (pure)                    │ │                 │
+│  AggregateRoot, DomainEvent, Command, ValueObject         │ │                 │
+├───────────────────────────────────────────────────────────┤ │                 │
+│                Persistence Layer (adapters)               │ │                 │
+│  EventStore, SnapshotStore, SagaStore, Repository,        │ │                 │
+│  idempotency stores, DeadLetterStore, UnitOfWork          │ │                 │
+├───────────────────────────────────────────────────────────┤ │                 │
+│                 Platform Layer (provider)                 │ │                 │
+│  Cloudflare (D1/Queue/Cron) / AWS (DynamoDB/SQS) / Local  │ │                 │
+└───────────────────────────────────────────────────────────┘ └─────────────────┘
 ```
 
-### 1.3 Data Flow
+Layers are drawn in call order: a request enters at the top and reaches storage at the bottom. Source dependencies run in a different order (§1.3).
+
+### 1.3 Layer Dependencies
+
+An arrow `A ──▶ B` means A depends on B. A layer may depend on any layer below it in this diagram, never on one above it. A dashed arrow `┄┄▶` is a dependency on contracts (interfaces) only.
+
+```
+  ┌─────────────────────────────────────┐
+  │          Worker Entry Point         │
+  └──────────────────┬──────────────────┘
+                     ▼
+  ┌─────────────────────────────────────┐
+  │         Framework (builder)         │  chooses the platform
+  └──────────────────┬──────────────────┘
+                     ▼
+  ┌─────────────────────────────────────┐
+  │         Platform (provider)         │  implements the Persistence
+  └──────────────────┬──────────────────┘  and Event Bus contracts
+                     ▼
+  ┌──────────────────┬──────────────────┐
+  │     Command      │    Event Bus     │
+  │     Pipeline     │(implementations) │
+  └──────────────────┴──────────────────┘
+                     ▼
+  ┌─────────────────────────────────────┐
+  │     Command / Projection / Saga     │┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄╮
+  │               Handlers              │                  ┆
+  └──────────────────┬──────────────────┘                  ▼
+                     ▼                        ┌────────────────────────┐
+  ┌─────────────────────────────────────┐     │  Event Bus contracts   │
+  │             Persistence             │┄┄┄┄▶│       EventBus,        │
+  └──────────────────┬──────────────────┘     │      EventHandler      │
+                     ▼                        └────────────────────────┘
+  ┌─────────────────────────────────────┐                  │
+  │            Domain (pure)            │◀─────────────────╯
+  └──────────────────┬──────────────────┘
+                     ▼
+  ┌─────────────────────────────────────┐
+  │                Kernel               │
+  └─────────────────────────────────────┘
+```
+
+- **Domain** depends only on the Kernel. It never references persistence, buses or platforms.
+- **Kernel** holds cross-cutting building blocks: the error hierarchy (§22), UUIDv7 generation (§2.1), and backoff with jitter (§16.2, §21.3). It depends on nothing, and every layer may use it.
+- **Platform** is at the bottom of the call order but near the top of the dependency order. It implements the Persistence contracts, including `UnitOfWork` (§11.4), and `EventBus` (§10). Only the Framework chooses a platform (§24).
+- **Event Bus contracts** (`EventBus`, `EventHandler`) belong to the Event Bus layer but depend only on the Domain. Handlers and Persistence may use these contracts, never the bus implementations: the Repository publishes through `EventBus` (§6.2), and projection and saga handlers implement `EventHandler` (§12.1, §13.3).
+
+### 1.4 Data Flow
 
 ```
 HTTP POST → Command → Pipeline → Handler → Aggregate.raise() → Event
@@ -607,6 +657,8 @@ Framework.dispatch(command):
 Projections/sagas registered on `strongEventBus` only — the queue consumer worker has its own `InMemoryEventBus`.
 
 ### 11.4 UnitOfWork
+
+Part of the Persistence layer (§1.2): the transaction boundary over the stores. The strong pipeline begins, commits and rolls it back.
 
 ```
 interface UnitOfWork:
